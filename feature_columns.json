@@ -1,0 +1,1 @@
+["step", "amount", "oldbalanceOrg", "newbalanceOrig", "oldbalanceDest", "newbalanceDest", "balanceDiffOrig", "balanceDiffDest", "zero_flag", "large_txn", "combined_flag", "risk_score", "zero_orig_flag", "zero_dest_flag", "large_txn_flag", "high_risk_type", "amount_balance_ratio", "type_CASH_OUT", "type_DEBIT", "type_PAYMENT", "type_TRANSFER"]
