@@ -1,0 +1,14 @@
+flask
+flask-cors
+gunicorn
+pandas
+numpy
+scikit-learn
+scipy
+joblib
+shap
+pymongo
+dnspython
+werkzeug
+email-validator
+openai
