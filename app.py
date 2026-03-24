@@ -8,6 +8,10 @@ Covers:
               /login/verify, /login/resend (aliases for frontend compat)
               /login/forgot-password, /login/reset-password
   - ML    : /predict, /process-dataset, /explain/<id>, /report/<id>, /ai-case/<id>
+  - Batch : /batches/<batch_id>/summary
+              /batches/<batch_id>/transactions  (paginated, filterable)
+              /batches/<batch_id>/all
+              /batches/<batch_id>/report
   - Admin : /admin/users (GET/POST), /admin/users/<id> (DELETE/PUT)
               /admin/transactions, /admin/logs, /admin/stats
   - Analyst: /analyst/cases (GET/POST)
@@ -31,15 +35,28 @@ Required environment variables:
   SENDER_EMAIL       Gmail address for OTP (optional)
   SENDER_PASSWORD    Gmail app password for OTP (optional)
   OTP_EXPIRY_MINUTES Minutes before OTP expires (default: 5)
+
+Response format change (v2 — batch refactor):
+  /predict and /process-dataset no longer return the full predictions array in the
+  upload response when a dataset is large.  Instead they return a batch_id plus
+  summary counts.  Use the /batches/* endpoints to retrieve all results.
+
+  POST /process-dataset  →  {success, batch_id, total_rows, flagged_count,
+                              legitimate_count, high_risk_count, medium_risk_count,
+                              low_risk_count, processing_time_seconds}
+
+  POST /predict          →  {success, batch_id, predictions (always included,
+                              size == input), total_rows, flagged_count, ...}
 """
 
 import os
 import json
 import math
+import time
 import random
 import logging
 import smtplib
-import hashlib
+import traceback
 import uuid
 from datetime import datetime, timedelta
 from io import StringIO
@@ -50,8 +67,18 @@ import joblib
 import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify, g
+
+
+# ─────────────────────────────────────────────
+# Custom exception for staged ML pipeline errors
+# ─────────────────────────────────────────────
+class PipelineError(Exception):
+    """Raised when the ML prediction pipeline fails at a specific stage."""
+    def __init__(self, message: str, stage: str):
+        super().__init__(message)
+        self.stage = stage
 from flask_cors import CORS
-from pymongo import MongoClient
+from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.server_api import ServerApi
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -104,8 +131,10 @@ SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 OTP_EXPIRY_MINUTES = int(os.environ.get("OTP_EXPIRY_MINUTES", 5))
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-# Default to a real model that exists — gpt-4o-mini is cheap and capable
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+# Chunk size for insert_many batches (tunable via env var)
+MONGO_INSERT_CHUNK = int(os.environ.get("MONGO_INSERT_CHUNK", 200))
 
 PROJECT_PATH = "."
 MODEL_PATH = os.path.join(PROJECT_PATH, "rf_model.pkl")
@@ -134,17 +163,27 @@ try:
     transactions_col     = db["transactions"]
     admin_col            = db["admin_actions"]
     ai_cache_col         = db["ai_cache"]
-    sessions_col         = db["sessions"]          # NEW: persistent sessions
-    analyst_cases_col    = db["analyst_cases"]     # NEW: analyst cases
-    analyst_reviews_col  = db["analyst_reviews"]   # NEW: review history
+    sessions_col         = db["sessions"]
+    analyst_cases_col    = db["analyst_cases"]
+    analyst_reviews_col  = db["analyst_reviews"]
+    batches_col          = db["batches"]          # NEW: batch metadata
 
-    # Ensure useful indexes
+    # Indexes
     sessions_col.create_index("token", unique=True, background=True)
     sessions_col.create_index("expires_at", expireAfterSeconds=0, background=True)
     analyst_cases_col.create_index("case_id", unique=True, background=True)
     analyst_cases_col.create_index("transaction_id", background=True)
     analyst_reviews_col.create_index("case_id", background=True)
     transactions_col.create_index("transaction_id", background=True)
+    # New batch-oriented indexes
+    transactions_col.create_index("batch_id", background=True)
+    transactions_col.create_index([("batch_id", ASCENDING), ("prediction", ASCENDING)],
+                                  background=True)
+    transactions_col.create_index([("batch_id", ASCENDING), ("risk_level", ASCENDING)],
+                                  background=True)
+    transactions_col.create_index([("batch_id", ASCENDING), ("created_at", DESCENDING)],
+                                  background=True)
+    batches_col.create_index("batch_id", unique=True, background=True)
 
     mongo_client.admin.command("ping")
     log.info("✅ MongoDB connected successfully!")
@@ -204,6 +243,7 @@ def handle_preflight():
 # Serialization Helpers
 # ─────────────────────────────────────────────
 def json_safe_value(value):
+    """Recursively convert any value to a JSON-serialisable Python type."""
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, np.integer):
@@ -211,8 +251,14 @@ def json_safe_value(value):
     if isinstance(value, np.floating):
         v = float(value)
         return None if (math.isnan(v) or math.isinf(v)) else v
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.ndarray):
+        return [json_safe_value(x) for x in value.tolist()]
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
     try:
         if pd.isna(value):
             return None
@@ -279,7 +325,6 @@ def log_admin_action(action, details=None):
 SESSION_TTL_HOURS = 24
 
 def create_session_token(user_doc):
-    """Create a persistent session token stored in MongoDB."""
     token = str(uuid.uuid4())
     expires_at = datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)
     sessions_col.insert_one({
@@ -296,7 +341,6 @@ def create_session_token(user_doc):
 
 
 def get_session_from_token(token):
-    """Look up session in MongoDB. Returns session doc or None."""
     if not token:
         return None
     session = sessions_col.find_one({"token": token})
@@ -309,14 +353,12 @@ def get_session_from_token(token):
 
 
 def get_current_user():
-    """Extract Bearer token from Authorization header and return session dict."""
     auth = request.headers.get("Authorization", "")
     token = auth[7:] if auth.startswith("Bearer ") else None
     return get_session_from_token(token)
 
 
 def require_auth(f):
-    """Decorator: require valid session token."""
     @wraps(f)
     def decorated(*args, **kwargs):
         user = get_current_user()
@@ -330,7 +372,6 @@ def require_auth(f):
 
 
 def require_admin(f):
-    """Decorator: require admin role."""
     @wraps(f)
     def decorated(*args, **kwargs):
         user = get_current_user()
@@ -369,33 +410,160 @@ def send_email_otp(to_email, otp_code):
         log.error(f"Failed to send OTP: {e}")
         return False
 
-# ─────────────────────────────────────────────
-# ML Helpers
-# ─────────────────────────────────────────────
-def predict_internal(new_data: pd.DataFrame):
-    processed = pd.get_dummies(new_data, drop_first=True)
-    for col in feature_cols:
-        if col not in processed.columns:
-            processed[col] = 0
-    aligned = processed[feature_cols].astype(float)
-    prob = model.predict_proba(aligned)[:, 1]
+# ═════════════════════════════════════════════
+# ML Helpers — hardened predict_internal
+# ═════════════════════════════════════════════
+
+# Required columns that must exist before we attempt prediction.
+# These are the raw input columns the model was trained on (pre-dummies).
+REQUIRED_INPUT_COLS = [
+    "step", "amount", "oldbalanceOrg", "newbalanceOrig",
+    "oldbalanceDest", "newbalanceDest",
+]
+
+def predict_internal(new_data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Run batch fraud prediction.
+
+    Parameters
+    ----------
+    new_data : pd.DataFrame
+        Raw transaction data.  May contain extra columns — they are ignored.
+
+    Returns
+    -------
+    pd.DataFrame with columns: prediction, fraud_score, risk_level
+
+    Raises
+    ------
+    ValueError  with a 'stage' attribute set to the failing pipeline step.
+    """
+
+    # ── 1. Validate shape / required columns ──────────────────────────────
+    log.info(f"[predict_internal] Input shape: {new_data.shape}")
+    log.info(f"[predict_internal] Columns: {list(new_data.columns)}")
+
+    null_counts = new_data.isnull().sum()
+    nonzero_nulls = null_counts[null_counts > 0]
+    if not nonzero_nulls.empty:
+        log.warning(f"[predict_internal] Null counts: {nonzero_nulls.to_dict()}")
+
+    log.info(f"[predict_internal] Dtypes: {new_data.dtypes.to_dict()}")
+
+    missing = [c for c in REQUIRED_INPUT_COLS if c not in new_data.columns]
+    if missing:
+        raise PipelineError(f"Missing required columns: {missing}", "column_validation")
+
+    # ── 2. get_dummies ─────────────────────────────────────────────────────
+    try:
+        t0 = time.time()
+        processed = pd.get_dummies(new_data, drop_first=True)
+        log.info(f"[predict_internal] get_dummies done in {time.time()-t0:.3f}s, "
+                 f"shape after: {processed.shape}")
+    except PipelineError:
+        raise
+    except Exception as exc:
+        log.error(f"[predict_internal] get_dummies failed: {exc}")
+        raise PipelineError(f"get_dummies failed: {exc}", "get_dummies") from exc
+
+    # ── 3. Column alignment ────────────────────────────────────────────────
+    try:
+        for col in feature_cols:
+            if col not in processed.columns:
+                processed[col] = 0
+        aligned = processed[feature_cols]
+        log.info(f"[predict_internal] Alignment done, shape: {aligned.shape}")
+    except PipelineError:
+        raise
+    except Exception as exc:
+        log.error(f"[predict_internal] column alignment failed: {exc}")
+        raise PipelineError(f"Column alignment failed: {exc}", "column_alignment") from exc
+
+    # ── 4. astype(float) ───────────────────────────────────────────────────
+    try:
+        aligned = aligned.astype(float)
+    except PipelineError:
+        raise
+    except Exception as exc:
+        log.error(f"[predict_internal] astype(float) failed: {exc}")
+        raise PipelineError(f"astype(float) failed: {exc}", "astype_float") from exc
+
+    # ── 5. predict_proba ───────────────────────────────────────────────────
+    try:
+        t0 = time.time()
+        prob = model.predict_proba(aligned)[:, 1]
+        log.info(f"[predict_internal] predict_proba done in {time.time()-t0:.3f}s "
+                 f"for {len(prob)} rows")
+    except PipelineError:
+        raise
+    except Exception as exc:
+        log.error(f"[predict_internal] predict_proba failed: {exc}")
+        raise PipelineError(f"predict_proba failed: {exc}", "predict_proba") from exc
+
     pred = (prob >= 0.5).astype(int)
     risk = pd.Series(
         np.where(prob < 0.2, "LOW", np.where(prob < 0.8, "MEDIUM", "HIGH")),
         index=aligned.index,
     )
-    return pd.DataFrame({"prediction": pred, "fraud_score": prob, "risk_level": risk},
-                        index=aligned.index)
+    return pd.DataFrame(
+        {"prediction": pred, "fraud_score": prob, "risk_level": risk},
+        index=aligned.index,
+    )
+
+
+# ═════════════════════════════════════════════
+# Batch helpers
+# ═════════════════════════════════════════════
+
+def new_batch_id() -> str:
+    """Generate a short, sortable batch identifier."""
+    return f"BATCH-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+
+
+def save_batch_metadata(batch_id: str, meta: dict):
+    """Upsert the batch summary document."""
+    batches_col.update_one(
+        {"batch_id": batch_id},
+        {"$set": {**meta, "batch_id": batch_id}},
+        upsert=True,
+    )
+
+
+def insert_many_chunked(collection, docs: list, chunk_size: int = MONGO_INSERT_CHUNK):
+    """
+    Insert a list of documents in chunks to avoid oversized write operations.
+    Returns the total number of inserted documents.
+    """
+    inserted = 0
+    for start in range(0, len(docs), chunk_size):
+        chunk = docs[start : start + chunk_size]
+        if chunk:
+            collection.insert_many(chunk, ordered=False)
+            inserted += len(chunk)
+    return inserted
+
+
+def compute_batch_stats(df: pd.DataFrame) -> dict:
+    """Derive summary counts from a scored dataframe."""
+    total       = len(df)
+    flagged     = int((df["prediction"] == 1).sum())
+    legitimate  = total - flagged
+    high_risk   = int((df["risk_level"] == "HIGH").sum())
+    medium_risk = int((df["risk_level"] == "MEDIUM").sum())
+    low_risk    = int((df["risk_level"] == "LOW").sum())
+    return {
+        "total_rows":       total,
+        "flagged_count":    flagged,
+        "legitimate_count": legitimate,
+        "high_risk_count":  high_risk,
+        "medium_risk_count": medium_risk,
+        "low_risk_count":   low_risk,
+    }
 
 # ─────────────────────────────────────────────
 # AI / OpenAI Helpers
 # ─────────────────────────────────────────────
 def call_openai_chat(prompt: str, fallback: str = "") -> str:
-    """
-    Call OpenAI Chat Completions API.
-    Returns the text response or fallback string if unavailable.
-    Uses the Chat Completions API (not the beta Responses API).
-    """
     if not openai_client:
         return fallback
     try:
@@ -422,7 +590,6 @@ def call_openai_chat(prompt: str, fallback: str = "") -> str:
 
 
 def call_openai_json(prompt: str, fallback_payload: dict) -> dict:
-    """Call OpenAI and parse JSON response. Falls back to fallback_payload."""
     if not openai_client:
         return fallback_payload
     clean = ""
@@ -430,7 +597,6 @@ def call_openai_json(prompt: str, fallback_payload: dict) -> dict:
         raw = call_openai_chat(prompt)
         if not raw:
             return fallback_payload
-        # Strip markdown code fences if present
         clean = raw.strip()
         if clean.startswith("```"):
             clean = "\n".join(clean.split("\n")[1:])
@@ -684,11 +850,8 @@ def _serialize_case(doc: dict) -> dict:
 
 
 def _build_analyst_case(transaction_id: str, txn_data: dict) -> dict:
-    """Build a full analyst case from transaction data + AI summary."""
     raw_score = safe_float(txn_data.get("fraud_score", 0))
-    # Normalise to 0–100 range for storage (frontend shows percentage)
     score_pct = raw_score if raw_score > 1 else raw_score * 100
-    # Keep 0–1 for derive helpers
     score_01 = score_pct / 100.0
 
     risk_level = (
@@ -705,7 +868,6 @@ def _build_analyst_case(transaction_id: str, txn_data: dict) -> dict:
     case_type = derived["case_type"]
     actions = derived["recommended_actions"]
 
-    # Evidence items
     evidence_items = [
         {"type": "model_score",      "label": "Fraud Model Score",  "value": f"{score_pct:.1f}%"},
         {"type": "amount",           "label": "Transaction Amount", "value": f"KES {safe_float(txn_data.get('amount', 0)):,.0f}"},
@@ -724,7 +886,6 @@ def _build_analyst_case(transaction_id: str, txn_data: dict) -> dict:
          "description": "Analyst case created and queued for review"},
     ]
 
-    # Narrative summary — OpenAI if available
     summary = (
         f"This transaction was flagged as {risk_level} risk with a fraud model score of "
         f"{score_pct:.1f}%. The system detected indicators consistent with possible fraud. "
@@ -810,28 +971,18 @@ def _build_overall_analysis_case(
     transactions_raw: list,
     txn_count: int,
 ) -> dict:
-    """
-    Build an analyst case for overall / bulk / full-batch analysis.
-
-    Supports scopes:
-      full_transaction_batch — entire uploaded dataset (flagged + legitimate)
-      all_flagged            — only flagged/suspicious transactions
-      high_risk / medium_risk / by_account / date_range / by_risk_level — subsets
-    """
     now = datetime.utcnow().isoformat()
     case_id = _next_case_id()
 
     total = txn_count
-    sample = transactions_raw  # up to 50 sent by frontend
+    sample = transactions_raw
 
-    # Compute basic stats from the sample
     flagged_count = sum(
         1 for t in sample
         if t.get("is_fraud") or safe_float(t.get("fraud_score", 0)) >= 0.5
     )
     legit_count = len(sample) - flagged_count
 
-    # For full-batch, extrapolate from sample proportion if we have more than sample
     if scope == "full_transaction_batch" and total > len(sample) and len(sample) > 0:
         ratio = flagged_count / len(sample)
         flagged_est = round(total * ratio)
@@ -840,20 +991,17 @@ def _build_overall_analysis_case(
         flagged_est = flagged_count
         legit_est   = legit_count
 
-    # Score stats from sample
     scores = [safe_float(t.get("fraud_score", 0)) for t in sample]
     scores_pct = [s * 100 if s <= 1 else s for s in scores]
     avg_score = sum(scores_pct) / len(scores_pct) if scores_pct else 0.0
     max_score = max(scores_pct) if scores_pct else 0.0
 
-    # Determine overall risk level from average score
     risk_level = (
         "HIGH"       if avg_score >= 70 else
         "SUSPICIOUS" if avg_score >= 50 else
         "MEDIUM"     if avg_score >= 30 else "LOW"
     )
 
-    # Scope-specific label and description
     scope_labels = {
         "full_transaction_batch": "Full Transaction Batch",
         "all_flagged":            "All Flagged Transactions",
@@ -865,7 +1013,6 @@ def _build_overall_analysis_case(
     }
     scope_label = scope_labels.get(scope, scope.replace("_", " ").title())
 
-    # Build case type and authorities based on overall risk
     authorities = []
     case_type   = "overall_suspicious_activity_review"
     if avg_score >= 70 or max_score >= 85:
@@ -877,7 +1024,6 @@ def _build_overall_analysis_case(
         authorities.append("Internal Review Only")
     authorities = list(dict.fromkeys(authorities))
 
-    # Reasons
     reasons = []
     if scope == "full_transaction_batch":
         reasons.append(f"Full dataset of {total} transactions submitted for operational analysis")
@@ -893,7 +1039,6 @@ def _build_overall_analysis_case(
         if avg_score > 0:
             reasons.append(f"Average risk score: {avg_score:.1f}%")
 
-    # Evidence items
     evidence_items = [
         {"type": "batch_scope",    "label": "Analysis Scope",          "value": scope_label},
         {"type": "total_count",    "label": "Total Transactions",       "value": str(total)},
@@ -912,7 +1057,6 @@ def _build_overall_analysis_case(
     if filters.get("account"):
         evidence_items.append({"type": "filter", "label": "Account Filter", "value": filters["account"]})
 
-    # Timeline
     timeline = [
         {"timestamp": now, "event": "batch_submitted",
          "description": f"Analyst submitted {scope_label} for overall analysis"},
@@ -920,7 +1064,6 @@ def _build_overall_analysis_case(
          "description": "Overall analysis case created and queued for review"},
     ]
 
-    # Narrative summary — OpenAI if available, rule-based fallback
     if scope == "full_transaction_batch":
         summary_fallback = (
             f"This overall analysis case covers the complete uploaded transaction dataset of "
@@ -1074,7 +1217,7 @@ def register_user():
     return jsonify({"success": True, "message": "User registered successfully"}), 201
 
 # ─────────────────────────────────────────────
-# Auth — Login  (returns session_token)
+# Auth — Login
 # ─────────────────────────────────────────────
 @app.route("/login", methods=["POST"])
 def login_user():
@@ -1116,7 +1259,7 @@ def login_user():
     }), 200
 
 # ─────────────────────────────────────────────
-# Auth — OTP routes (original paths)
+# Auth — OTP routes
 # ─────────────────────────────────────────────
 @app.route("/request-otp", methods=["POST"])
 def request_otp():
@@ -1164,25 +1307,18 @@ def verify_otp():
         },
     }), 200
 
-# ─────────────────────────────────────────────
-# Auth — Frontend alias paths
-# The frontend calls /login/verify, /login/resend, etc.
-# ─────────────────────────────────────────────
+
 @app.route("/login/verify", methods=["POST"])
 def login_verify_alias():
-    """Alias: frontend calls /login/verify with {temp_token, otp_code}."""
     data = request.get_json(silent=True) or {}
-    # Accept either format
     otp = data.get("otp_code") or data.get("otp")
     temp_token = data.get("temp_token") or data.get("email")
-    # temp_token here is actually the email in the frontend flow
     request._cached_json = ({"email": temp_token, "otp": otp}, True)
     return verify_otp()
 
 
 @app.route("/login/resend", methods=["POST"])
 def login_resend_alias():
-    """Alias: frontend calls /login/resend with {temp_token}."""
     data = request.get_json(silent=True) or {}
     email = data.get("temp_token") or data.get("email")
     request._cached_json = ({"email": email}, True)
@@ -1197,7 +1333,6 @@ def forgot_password():
         return jsonify({"success": False, "error": "Email required"}), 400
     user = users_col.find_one({"email": email})
     if not user:
-        # Don't leak whether user exists
         return jsonify({"success": True, "message": "If this email exists, a reset code has been sent"}), 200
     otp = generate_otp()
     expiry = datetime.utcnow() + timedelta(minutes=15)
@@ -1254,84 +1389,403 @@ def logout():
         sessions_col.delete_one({"token": token})
     return jsonify({"success": True, "message": "Logged out"}), 200
 
-# ─────────────────────────────────────────────
-# ML — Predict
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
+# ML — /predict  (hardened, batch-first)
+# ═════════════════════════════════════════════
 @app.route("/predict", methods=["POST"])
 def predict_endpoint():
+    t_request_start = time.time()
     data = request.get_json(silent=True) or {}
-    transactions_list = data.get("transactions")
+    t_parse = time.time()
+    log.info(f"[/predict] request parse: {t_parse - t_request_start:.3f}s")
 
+    transactions_list = data.get("transactions")
     if not isinstance(transactions_list, list) or len(transactions_list) == 0:
         return jsonify({"success": False, "error": "'transactions' must be a non-empty list"}), 400
 
+    batch_id = new_batch_id()
+    log.info(f"[/predict] batch_id={batch_id}, rows={len(transactions_list)}")
+
     try:
+        # ── Build DataFrame ──────────────────────────────────────────────
         ID_COL = "__txn_id__"
         for i, txn in enumerate(transactions_list):
             if not isinstance(txn, dict):
-                return jsonify({"success": False, "error": "Each transaction must be an object"}), 400
+                return jsonify({"success": False,
+                                "error": "Each transaction must be an object",
+                                "stage": "request_parse"}), 400
             txn[ID_COL] = txn.get("transaction_id") or txn.get("id") or f"TXN_{i+1}"
 
+        t_df_start = time.time()
         df = pd.DataFrame(transactions_list).set_index(ID_COL)
-        results = predict_internal(df)
+        log.info(f"[/predict] DataFrame built in {time.time()-t_df_start:.3f}s, shape={df.shape}")
+
+        # ── Predict ──────────────────────────────────────────────────────
+        t_pred_start = time.time()
+        try:
+            results = predict_internal(df)
+        except PipelineError as ve:
+            stage = ve.stage
+            log.error(f"[/predict] predict_internal failed at stage={stage}: {ve}")
+            return jsonify({
+                "success": False,
+                "stage": stage,
+                "message": str(ve),
+                "batch_id": batch_id,
+            }), 422
+        t_pred_end = time.time()
+        log.info(f"[/predict] prediction done in {t_pred_end - t_pred_start:.3f}s")
+
+        # ── Attach results + build Mongo docs ────────────────────────────
         response_data = []
+        mongo_docs    = []
+        now           = datetime.utcnow()
 
         for i in range(len(results)):
             txn_id = str(df.index[i])
-            item = {
+            pred   = int(results.iloc[i]["prediction"])
+            score  = float(results.iloc[i]["fraud_score"])
+            risk   = str(results.iloc[i]["risk_level"])
+
+            response_data.append({
                 "transaction_id": txn_id,
-                "prediction": int(results.iloc[i]["prediction"]),
-                "fraud_score": float(results.iloc[i]["fraud_score"]),
-                "risk_level": str(results.iloc[i]["risk_level"]),
-            }
-            response_data.append(item)
-            record = transactions_list[i].copy()
-            record.pop(ID_COL, None)
-            record.update(item)
-            record["created_at"] = datetime.utcnow()
-            transactions_col.insert_one(record)
+                "prediction":     pred,
+                "fraud_score":    json_safe_value(score),
+                "risk_level":     risk,
+            })
 
-        return jsonify({"success": True, "predictions": response_data}), 200
+            record = {k: json_safe_value(v)
+                      for k, v in transactions_list[i].items()
+                      if k != ID_COL}
+            record.update({
+                "transaction_id": txn_id,
+                "prediction":     pred,
+                "fraud_score":    json_safe_value(score),
+                "risk_level":     risk,
+                "batch_id":       batch_id,
+                "created_at":     now,
+            })
+            mongo_docs.append(record)
+
+        # ── Batch Mongo writes ────────────────────────────────────────────
+        t_mongo_start = time.time()
+        inserted = insert_many_chunked(transactions_col, mongo_docs, MONGO_INSERT_CHUNK)
+        t_mongo_end = time.time()
+        log.info(f"[/predict] Mongo write: {inserted} docs in {t_mongo_end - t_mongo_start:.3f}s "
+                 f"({MONGO_INSERT_CHUNK}-doc chunks)")
+
+        # ── Batch stats + metadata ────────────────────────────────────────
+        stats = compute_batch_stats(results)
+        processing_time = round(t_mongo_end - t_request_start, 3)
+
+        save_batch_metadata(batch_id, {
+            **stats,
+            "source":               "predict_endpoint",
+            "processing_time_seconds": processing_time,
+            "created_at":           now,
+        })
+
+        log_admin_action("predict", {"batch_id": batch_id, "rows": len(transactions_list)})
+
+        # ── Build response ────────────────────────────────────────────────
+        t_resp_start = time.time()
+        response = {
+            "success":                  True,
+            "batch_id":                 batch_id,
+            "predictions":              response_data,   # always included for /predict
+            **stats,
+            "processing_time_seconds":  processing_time,
+        }
+        log.info(f"[/predict] response built in {time.time()-t_resp_start:.3f}s, "
+                 f"total={processing_time}s")
+        return jsonify(response), 200
+
     except Exception as e:
-        log.exception("Prediction failed")
-        return jsonify({"success": False, "error": "Prediction failed", "detail": str(e)}), 500
+        log.error(f"[/predict] Unhandled error: {e}")
+        log.error(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "stage":   "unhandled",
+            "message": "Prediction failed",
+            "detail":  str(e),
+        }), 500
 
-# ─────────────────────────────────────────────
-# ML — Process Dataset
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
+# ML — /process-dataset  (hardened, batch-first)
+# ═════════════════════════════════════════════
 @app.route("/process-dataset", methods=["POST"])
 def process_dataset():
+    t_request_start = time.time()
+
     try:
         data = request.get_json(silent=True) or {}
+        t_parse = time.time()
+        log.info(f"[/process-dataset] request parse: {t_parse - t_request_start:.3f}s")
+
         csv_content = data.get("csv_content")
-        file_name = data.get("file_name", "dataset.csv")
+        file_name   = data.get("file_name", "dataset.csv")
+
         if not csv_content:
-            return jsonify({"success": False, "error": "Missing 'csv_content'"}), 400
-        df = pd.read_csv(StringIO(csv_content))
+            return jsonify({"success": False, "error": "Missing 'csv_content'",
+                            "stage": "request_parse"}), 400
+
+        batch_id = new_batch_id()
+        log.info(f"[/process-dataset] batch_id={batch_id}, file={file_name}")
+
+        # ── Parse CSV ─────────────────────────────────────────────────────
+        try:
+            t_df_start = time.time()
+            df = pd.read_csv(StringIO(csv_content))
+            log.info(f"[/process-dataset] CSV parsed in {time.time()-t_df_start:.3f}s, "
+                     f"shape={df.shape}")
+        except Exception as exc:
+            log.error(f"[/process-dataset] CSV parse failed: {exc}")
+            return jsonify({"success": False, "stage": "csv_parse",
+                            "message": f"CSV parse failed: {exc}"}), 422
+
         if df.empty:
-            return jsonify({"success": False, "error": "CSV is empty"}), 400
-        results = predict_internal(df)
+            return jsonify({"success": False, "error": "CSV is empty",
+                            "stage": "csv_parse"}), 400
+
+        # Log dataframe diagnostics
+        log.info(f"[/process-dataset] Columns: {list(df.columns)}")
+        null_counts = df.isnull().sum()
+        nonzero = null_counts[null_counts > 0]
+        if not nonzero.empty:
+            log.warning(f"[/process-dataset] Null counts: {nonzero.to_dict()}")
+        log.info(f"[/process-dataset] Dtypes: {df.dtypes.to_dict()}")
+
+        # ── Predict ────────────────────────────────────────────────────────
+        t_pred_start = time.time()
+        try:
+            results = predict_internal(df)
+        except PipelineError as ve:
+            stage = ve.stage
+            log.error(f"[/process-dataset] predict_internal failed at stage={stage}: {ve}")
+            return jsonify({
+                "success": False,
+                "stage":   stage,
+                "message": str(ve),
+                "batch_id": batch_id,
+            }), 422
+        t_pred_end = time.time()
+        log.info(f"[/process-dataset] prediction done in {t_pred_end - t_pred_start:.3f}s "
+                 f"for {len(results)} rows")
+
+        # ── Attach predictions ─────────────────────────────────────────────
+        df = df.copy()
         df["prediction"]  = results["prediction"].values
         df["fraud_score"] = results["fraud_score"].values
         df["risk_level"]  = results["risk_level"].values
+        df["batch_id"]    = batch_id
+
         if "transaction_id" not in df.columns:
             df["transaction_id"] = [f"TXN_{i+1}" for i in range(len(df))]
-        inserted = 0
-        for _, row in df.iterrows():
-            record = {k: json_safe_value(v) for k, v in row.to_dict().items()}
-            record["created_at"] = datetime.utcnow()
-            transactions_col.insert_one(record)
-            inserted += 1
-        log_admin_action("process_dataset", {"file_name": file_name, "rows": inserted})
-        return jsonify({
-            "success": True,
-            "message": f"{inserted} transactions processed",
+
+        # ── Compute stats ──────────────────────────────────────────────────
+        stats = compute_batch_stats(results)
+
+        # ── Build Mongo docs ───────────────────────────────────────────────
+        now = datetime.utcnow()
+        mongo_docs = []
+        for row in df.to_dict(orient="records"):
+            record = {k: json_safe_value(v) for k, v in row.items()}
+            record["created_at"] = now
+            mongo_docs.append(record)
+
+        # ── Bulk Mongo insert in chunks ────────────────────────────────────
+        t_mongo_start = time.time()
+        inserted = insert_many_chunked(transactions_col, mongo_docs, MONGO_INSERT_CHUNK)
+        t_mongo_end = time.time()
+        log.info(f"[/process-dataset] Mongo write: {inserted} docs in "
+                 f"{t_mongo_end - t_mongo_start:.3f}s ({MONGO_INSERT_CHUNK}-doc chunks)")
+
+        # ── Save batch metadata ────────────────────────────────────────────
+        processing_time = round(t_mongo_end - t_request_start, 3)
+        save_batch_metadata(batch_id, {
+            **stats,
+            "file_name":               file_name,
+            "source":                  "process_dataset",
+            "processing_time_seconds": processing_time,
+            "created_at":              now,
+        })
+
+        log_admin_action("process_dataset", {
+            "batch_id":  batch_id,
             "file_name": file_name,
-            "predictions": serialize_documents(df.to_dict(orient="records")),
+            "rows":      inserted,
+        })
+
+        # ── Build response (summary only — no full dataset in response) ────
+        t_resp_start = time.time()
+        response = {
+            "success":                  True,
+            "batch_id":                 batch_id,
+            **stats,
+            "file_name":                file_name,
+            "processing_time_seconds":  processing_time,
+            # Retrieval instructions for the frontend
+            "results_url":              f"/batches/{batch_id}/transactions",
+            "summary_url":              f"/batches/{batch_id}/summary",
+        }
+        log.info(f"[/process-dataset] response built in {time.time()-t_resp_start:.3f}s, "
+                 f"total={processing_time}s")
+        return jsonify(response), 200
+
+    except Exception as e:
+        log.error(f"[/process-dataset] Unhandled error: {e}")
+        log.error(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "stage":   "unhandled",
+            "message": "Dataset processing failed",
+            "detail":  str(e),
+        }), 500
+
+# ═════════════════════════════════════════════
+# Batch Retrieval Endpoints
+# ═════════════════════════════════════════════
+
+@app.route("/batches/<batch_id>/summary", methods=["GET"])
+def batch_summary(batch_id):
+    """
+    GET /batches/<batch_id>/summary
+
+    Returns the batch metadata + summary counts.
+    """
+    try:
+        meta = batches_col.find_one({"batch_id": batch_id})
+        if not meta:
+            return jsonify({"success": False, "error": "Batch not found"}), 404
+        return jsonify({"success": True, "batch": serialize_document(meta)}), 200
+    except Exception as e:
+        log.exception(f"[batch_summary] failed for {batch_id}")
+        return jsonify({"success": False, "error": "Failed to load batch summary"}), 500
+
+
+@app.route("/batches/<batch_id>/transactions", methods=["GET"])
+def batch_transactions(batch_id):
+    """
+    GET /batches/<batch_id>/transactions
+
+    Query parameters:
+      page            (int, default 1)
+      limit           (int, default 100, max 1000)
+      suspicious_only (bool string "true"/"false", default false)
+      risk_level      ("HIGH" | "MEDIUM" | "LOW")
+
+    Returns paginated transaction documents for the batch.
+    All rows are always available — use pagination to retrieve them.
+    """
+    try:
+        page  = max(1, safe_int(request.args.get("page", 1), 1))
+        limit = min(1000, max(1, safe_int(request.args.get("limit", 100), 100)))
+        skip  = (page - 1) * limit
+
+        query: dict = {"batch_id": batch_id}
+
+        suspicious_only = request.args.get("suspicious_only", "").lower() == "true"
+        if suspicious_only:
+            query["prediction"] = 1
+
+        risk_level = request.args.get("risk_level", "").upper()
+        if risk_level in {"HIGH", "MEDIUM", "LOW"}:
+            query["risk_level"] = risk_level
+
+        total = transactions_col.count_documents(query)
+        docs  = list(
+            transactions_col.find(query)
+            .sort("fraud_score", DESCENDING)
+            .skip(skip)
+            .limit(limit)
+        )
+
+        return jsonify({
+            "success":    True,
+            "batch_id":   batch_id,
+            "page":       page,
+            "limit":      limit,
+            "total":      total,
+            "pages":      math.ceil(total / limit) if limit else 1,
+            "transactions": serialize_documents(docs),
         }), 200
     except Exception as e:
-        log.exception("Dataset processing failed")
-        return jsonify({"success": False, "error": "Failed to process dataset", "detail": str(e)}), 500
+        log.exception(f"[batch_transactions] failed for {batch_id}")
+        return jsonify({"success": False, "error": "Failed to load transactions"}), 500
+
+
+@app.route("/batches/<batch_id>/all", methods=["GET"])
+def batch_all(batch_id):
+    """
+    GET /batches/<batch_id>/all
+
+    Returns ALL transactions in the batch (no pagination).
+    Use carefully — intended for exports and AI assistant bulk access.
+    Enforces a hard cap of 10,000 rows to protect memory.
+    """
+    try:
+        CAP = 10_000
+        docs = list(
+            transactions_col.find({"batch_id": batch_id})
+            .sort("fraud_score", DESCENDING)
+            .limit(CAP)
+        )
+        total = transactions_col.count_documents({"batch_id": batch_id})
+        return jsonify({
+            "success":      True,
+            "batch_id":     batch_id,
+            "total":        total,
+            "returned":     len(docs),
+            "capped":       total > CAP,
+            "transactions": serialize_documents(docs),
+        }), 200
+    except Exception as e:
+        log.exception(f"[batch_all] failed for {batch_id}")
+        return jsonify({"success": False, "error": "Failed to load batch"}), 500
+
+
+@app.route("/batches/<batch_id>/report", methods=["GET"])
+def batch_report(batch_id):
+    """
+    GET /batches/<batch_id>/report
+
+    Returns a structured summary report for the batch including:
+    - metadata / stats
+    - top-10 highest scoring suspicious transactions
+    - risk distribution breakdown
+    """
+    try:
+        meta = batches_col.find_one({"batch_id": batch_id})
+        if not meta:
+            return jsonify({"success": False, "error": "Batch not found"}), 404
+
+        # Top 10 suspicious
+        top_flagged = list(
+            transactions_col.find({"batch_id": batch_id, "prediction": 1})
+            .sort("fraud_score", DESCENDING)
+            .limit(10)
+        )
+
+        # Risk distribution
+        pipeline = [
+            {"$match": {"batch_id": batch_id}},
+            {"$group": {"_id": "$risk_level", "count": {"$sum": 1}}},
+        ]
+        dist_raw = list(transactions_col.aggregate(pipeline))
+        risk_distribution = {d["_id"]: d["count"] for d in dist_raw if d.get("_id")}
+
+        meta_safe = serialize_document(meta) or {}
+        return jsonify({
+            "success":           True,
+            "batch_id":          batch_id,
+            "summary":           meta_safe,
+            "risk_distribution": risk_distribution,
+            "top_flagged_transactions": serialize_documents(top_flagged),
+        }), 200
+    except Exception as e:
+        log.exception(f"[batch_report] failed for {batch_id}")
+        return jsonify({"success": False, "error": "Failed to generate batch report"}), 500
+
 
 # ─────────────────────────────────────────────
 # AI — Explain / Report / Bundle
@@ -1344,10 +1798,14 @@ def explain_transaction(transaction_id):
             return jsonify({"success": False, "error": "Transaction not found"}), 404
         cached = get_cached_ai_result(transaction_id, "explanation")
         if cached and isinstance(cached.get("payload"), dict):
-            return jsonify({"success": True, "cached": True, **cached["payload"]}), 200
+            resp = {"success": True, "cached": True}
+            resp.update(cached["payload"])  # type: ignore[arg-type]
+            return jsonify(resp), 200
         result = generate_ai_transaction_explanation(txn)
         save_cached_ai_result(transaction_id, "explanation", result)
-        return jsonify({"success": True, "cached": False, **result}), 200
+        resp = {"success": True, "cached": False}
+        resp.update(result)
+        return jsonify(resp), 200
     except Exception as e:
         log.exception("Explain failed")
         return jsonify({"success": False, "error": "Failed to explain transaction"}), 500
@@ -1361,10 +1819,14 @@ def report_transaction(transaction_id):
             return jsonify({"success": False, "error": "Transaction not found"}), 404
         cached = get_cached_ai_result(transaction_id, "report")
         if cached and isinstance(cached.get("payload"), dict):
-            return jsonify({"success": True, "cached": True, **cached["payload"]}), 200
+            resp = {"success": True, "cached": True}
+            resp.update(cached["payload"])  # type: ignore[arg-type]
+            return jsonify(resp), 200
         result = generate_ai_report(txn)
         save_cached_ai_result(transaction_id, "report", result)
-        return jsonify({"success": True, "cached": False, **result}), 200
+        resp = {"success": True, "cached": False}
+        resp.update(result)
+        return jsonify(resp), 200
     except Exception as e:
         log.exception("Report failed")
         return jsonify({"success": False, "error": "Failed to generate report"}), 500
@@ -1378,10 +1840,14 @@ def ai_case_bundle(transaction_id):
             return jsonify({"success": False, "error": "Transaction not found"}), 404
         cached = get_cached_ai_result(transaction_id, "case_bundle")
         if cached and isinstance(cached.get("payload"), dict):
-            return jsonify({"success": True, "cached": True, **cached["payload"]}), 200
+            resp = {"success": True, "cached": True}
+            resp.update(cached["payload"])  # type: ignore[arg-type]
+            return jsonify(resp), 200
         result = generate_ai_case_bundle(txn)
         save_cached_ai_result(transaction_id, "case_bundle", result)
-        return jsonify({"success": True, "cached": False, **result}), 200
+        resp = {"success": True, "cached": False}
+        resp.update(result)
+        return jsonify(resp), 200
     except Exception as e:
         log.exception("AI case bundle failed")
         return jsonify({"success": False, "error": "Failed to generate AI case bundle"}), 500
@@ -1397,7 +1863,7 @@ def admin_users():
             safe_users = []
             for u in users:
                 d = serialize_document(u) or {}
-                d.pop("password", None)  # never expose password hash
+                d.pop("password", None)
                 safe_users.append(d)
             return jsonify({"success": True, "users": safe_users}), 200
 
@@ -1439,7 +1905,6 @@ def admin_user_detail(user_id):
             log_admin_action("delete_user", {"user_id": user_id})
             return jsonify({"success": True, "message": "User deleted"}), 200
 
-        # PUT — toggle status
         data = request.get_json(silent=True) or {}
         is_active = data.get("is_active", True)
         result = users_col.update_one({"_id": oid}, {"$set": {"is_active": is_active}})
@@ -1454,12 +1919,9 @@ def admin_user_detail(user_id):
 
 @app.route("/admin/users/<user_id>/status", methods=["PUT"])
 def admin_user_status(user_id):
-    """Alias matching frontend call pattern /admin/users/:id/status."""
     return admin_user_detail(user_id)
 
-# ─────────────────────────────────────────────
-# Admin — Transactions / Logs / Stats
-# ─────────────────────────────────────────────
+
 @app.route("/admin/transactions", methods=["GET"])
 def admin_transactions():
     try:
@@ -1492,6 +1954,7 @@ def admin_stats():
             "flagged_transactions": transactions_col.count_documents({"prediction": 1}),
             "ai_cached_items":      ai_cache_col.count_documents({}),
             "analyst_cases":        analyst_cases_col.count_documents({}),
+            "total_batches":        batches_col.count_documents({}),
         }
         return jsonify({"success": True, "stats": stats}), 200
     except Exception as e:
@@ -1516,12 +1979,10 @@ def analyst_cases():
             log.exception("GET /analyst/cases failed")
             return jsonify({"success": False, "error": "Failed to fetch cases"}), 500
 
-    # ── POST — create case ───────────────────────────────────────────────────
     try:
         data = request.get_json(silent=True) or {}
         analysis_mode = data.get("analysis_mode", "single_transaction")
 
-        # ── Overall / Bulk / Full-batch analysis ────────────────────────────
         if analysis_mode == "overall_analysis":
             scope            = data.get("scope", "all_flagged")
             filters          = data.get("filters", {})
@@ -1537,13 +1998,11 @@ def analyst_cases():
             })
             return jsonify({"success": True, "case": _serialize_case(case)}), 201
 
-        # ── Single transaction analysis (default) ───────────────────────────
         transaction_id = data.get("transaction_id")
         txn_data       = data.get("transaction", {})
         if not transaction_id:
             return jsonify({"success": False, "error": "transaction_id is required"}), 400
 
-        # Deduplicate: return existing case if one already exists for this txn
         existing = analyst_cases_col.find_one({"transaction_id": transaction_id})
         if existing:
             return jsonify({"success": True, "case": _serialize_case(existing)}), 200
@@ -1578,7 +2037,6 @@ def analyst_case_detail(case_id):
             log_admin_action("close_analyst_case", {"case_id": case_id})
             return jsonify({"success": True, "message": "Case closed"}), 200
 
-        # PUT — partial update
         data = request.get_json(silent=True) or {}
         allowed_updates = {k: v for k, v in data.items()
                            if k in {"status", "last_action", "notes"}}
@@ -1648,7 +2106,6 @@ Answer in 3-5 sentences. Be professional, direct, and operationally useful."""
         if answer:
             return answer
 
-    # Rule-based fallback
     q = question.lower()
     if any(w in q for w in ["dci", "why dci", "route"]):
         return (f"DCI routing is recommended because the fraud score of {risk_score:.1f}% "
@@ -1697,7 +2154,6 @@ Answer in 3-5 sentences. Be professional, direct, and operationally useful."""
         return (f"This case {msg} for external reporting at this stage. "
                 f"Internal review is appropriate when evidence is incomplete. "
                 f"Document your rationale in the analyst notes before closing.")
-    # Generic
     return (f"This case has a risk score of {risk_score:.1f}% ({risk_level}) with "
             f"{len(reasons)} flagging indicators. "
             f"Primary reasons: {'; '.join(reasons[:3]) or 'standard model alert'}. "
