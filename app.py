@@ -58,6 +58,8 @@ import logging
 import smtplib
 import traceback
 import uuid
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from io import StringIO
 from email.mime.text import MIMEText
@@ -132,6 +134,13 @@ OTP_EXPIRY_MINUTES = int(os.environ.get("OTP_EXPIRY_MINUTES", 5))
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+# ─── FRC Integration ──────────────────────────────────────────────────────────
+# Set these environment variables in Render (or .env locally).
+FRC_API_URL      = os.environ.get("FRC_API_URL",
+                                   "https://financial-intelligence-processing-system.onrender.com/api/v1")
+FRC_API_KEY      = os.environ.get("FRC_API_KEY", "")          # X-Institution-API-Key
+FRC_INTAKE_PATH  = "/intake/cases"
 
 # Chunk size for insert_many batches (tunable via env var)
 MONGO_INSERT_CHUNK = int(os.environ.get("MONGO_INSERT_CHUNK", 200))
@@ -318,6 +327,146 @@ def log_admin_action(action, details=None):
         })
     except Exception as e:
         log.warning(f"Failed to log admin action: {e}")
+
+
+# ─────────────────────────────────────────────
+# FRC Intake Submission Helper
+# ─────────────────────────────────────────────
+def build_frc_payload(case: dict) -> dict:
+    """
+    Build the structured JSON payload for the FRC intake endpoint
+    from a FraudGuard analyst case document.
+    """
+    raw_score = safe_float(case.get("risk_score", 0))
+    # Normalise: if score was stored as a percentage (e.g. 87.3) convert to 0-1
+    score_01 = raw_score / 100.0 if raw_score > 1 else raw_score
+
+    txn_type = ""
+    for ev in (case.get("evidence") or []):
+        if ev.get("type") == "transaction_type":
+            txn_type = ev.get("value", "")
+            break
+
+    # Map FraudGuard case_type → FRC report_type
+    case_type_lower = (case.get("case_type") or "").lower()
+    if "suspicious" in case_type_lower or "fraud" in case_type_lower:
+        report_type = "suspicious_activity_report"
+    else:
+        report_type = "regulatory_threshold_report"
+
+    # Map risk drivers to FRC triggering_rules
+    triggering_rules = []
+    if score_01 >= 0.7 or "TRANSFER" in txn_type.upper() or "CASH_OUT" in txn_type.upper():
+        triggering_rules.append("POCAMLA-S44-STR-GENERAL")
+    if score_01 >= 0.85:
+        triggering_rules.append("POCAMLA-REG38-STR-DETAIL")
+    amount = safe_float(case.get("structured_report", {}).get("risk_score") or
+                        next((e.get("value", "0").replace("KES ", "").replace(",", "")
+                              for e in (case.get("evidence") or [])
+                              if e.get("type") == "amount"), "0"))
+    if amount == 0:
+        # Try to parse from evidence label "KES 250,000"
+        for ev in (case.get("evidence") or []):
+            if ev.get("type") == "amount":
+                try:
+                    amount = float(str(ev.get("value", "0")).replace("KES ", "").replace(",", ""))
+                except Exception:
+                    amount = 0
+                break
+
+    # Build concise transaction summary
+    reasons = case.get("reasons") or []
+    summary = case.get("summary") or "Transaction flagged as suspicious."
+    tx_summary = f"{summary} Risk indicators: {'; '.join(reasons[:3])}." if reasons else summary
+
+    # Evidence references
+    evidence_refs = []
+    for ev in (case.get("evidence") or []):
+        if ev.get("type") in ("model_score", "rule_trigger", "transaction_type"):
+            evidence_refs.append({
+                "label": ev.get("label", ev.get("type")),
+                "reference_type": "note",
+                "reference_value": str(ev.get("value", "")),
+                "description": f"FraudGuard evidence: {ev.get('type')}",
+            })
+
+    payload = {
+        "external_report_id": case.get("case_id"),
+        "report_type": report_type,
+        "amount": round(amount, 2) if amount else None,
+        "currency": "KES",
+        "transaction_summary": tx_summary[:2000],
+        "triggering_rules": triggering_rules if triggering_rules else ["POCAMLA-S44-STR-GENERAL"],
+        "risk_score": round(score_01, 4),
+        "narrative": (case.get("narrative_report") or case.get("summary") or "")[:5000],
+        "timestamp": case.get("created_at"),
+        "evidence_refs": evidence_refs[:10],
+        "submission_metadata": {
+            "source_system": "FraudGuard",
+            "source_case_id": case.get("case_id"),
+            "source_transaction_id": case.get("transaction_id"),
+            "source_risk_level": case.get("risk_level"),
+            "source_case_type": case.get("case_type"),
+            "submitted_by": "FraudGuard analyst escalation",
+        },
+    }
+    return payload
+
+
+def submit_to_frc(case: dict) -> dict:
+    """
+    Submit a FraudGuard analyst case to the FRC backend intake endpoint.
+
+    Returns a dict with keys:
+      success    bool
+      frc_case_id  str | None
+      status     str
+      message    str
+      error      str | None
+    """
+    if not FRC_API_KEY:
+        msg = "FRC_API_KEY not configured. Set the environment variable to enable FRC submission."
+        log.warning(msg)
+        return {"success": False, "frc_case_id": None, "status": "failed", "message": msg, "error": msg}
+
+    url = f"{FRC_API_URL.rstrip('/')}{FRC_INTAKE_PATH}"
+    payload = build_frc_payload(case)
+
+    try:
+        body_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "X-Institution-API-Key": FRC_API_KEY,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp_body = json.loads(resp.read().decode("utf-8"))
+            frc_case_id = resp_body.get("frc_case_id")
+            log.info(f"FRC intake success: frc_case_id={frc_case_id} source={case.get('case_id')}")
+            return {
+                "success": True,
+                "frc_case_id": frc_case_id,
+                "status": "acknowledged",
+                "message": resp_body.get("message", "Case submitted to FRC successfully."),
+                "error": None,
+            }
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8")
+        except Exception:
+            pass
+        msg = f"FRC intake HTTP {e.code}: {err_body[:300]}"
+        log.error(f"FRC submission failed: {msg} | source_case={case.get('case_id')}")
+        return {"success": False, "frc_case_id": None, "status": "failed", "message": msg, "error": msg}
+    except Exception as e:
+        msg = f"FRC submission error: {str(e)[:300]}"
+        log.error(f"{msg} | source_case={case.get('case_id')}")
+        return {"success": False, "frc_case_id": None, "status": "failed", "message": msg, "error": msg}
 
 # ─────────────────────────────────────────────
 # Token / Session Management  (MongoDB-backed)
@@ -2203,13 +2352,37 @@ def analyst_review():
             "mark_reviewed":    f"Case marked as reviewed by {reviewer_name}",
         }
 
-        analyst_cases_col.update_one({"case_id": case_id}, {"$set": {
+        update_fields = {
             "status":                    status_map.get(decision, case.get("status")),
             "last_action":               message_map.get(decision, decision),
             "audit.reviewer_decision":   decision,
             "audit.reviewer_notes":      reviewer_notes,
             "audit.review_timestamp":    now,
-        }})
+        }
+
+        # ── FRC auto-submission on escalate or approve ────────────────────────
+        frc_result = None
+        if decision in ("escalate", "approve"):
+            existing_frc_id = case.get("frc_case_id")
+            if existing_frc_id:
+                # Already submitted — skip re-submission
+                frc_result = {
+                    "success": True,
+                    "frc_case_id": existing_frc_id,
+                    "status": "already_submitted",
+                    "message": f"Case already submitted to FRC as {existing_frc_id}.",
+                }
+            else:
+                frc_result = submit_to_frc(case)
+                if frc_result["success"]:
+                    update_fields["frc_submission_status"] = "acknowledged"
+                    update_fields["frc_case_id"]           = frc_result.get("frc_case_id")
+                    update_fields["frc_submitted_at"]      = now
+                else:
+                    update_fields["frc_submission_status"] = "failed"
+                    update_fields["frc_submission_error"]  = frc_result.get("error", "")
+
+        analyst_cases_col.update_one({"case_id": case_id}, {"$set": update_fields})
 
         review_doc = {
             "case_id":          case_id,
@@ -2222,12 +2395,15 @@ def analyst_review():
         log_admin_action("analyst_review", {"case_id": case_id, "decision": decision})
 
         updated = analyst_cases_col.find_one({"case_id": case_id})
-        return jsonify({
+        response = {
             "success": True,
             "message": message_map.get(decision),
             "review": {k: v for k, v in review_doc.items() if k != "_id"},
             "case": _serialize_case(updated),
-        }), 200
+        }
+        if frc_result is not None:
+            response["frc_submission"] = frc_result
+        return jsonify(response), 200
     except Exception as e:
         log.exception("analyst_review failed")
         return jsonify({"success": False, "error": "Review submission failed"}), 500
@@ -2299,6 +2475,79 @@ def analyst_send_review(case_id):
     except Exception as e:
         log.exception("analyst_send_review failed")
         return jsonify({"success": False, "error": "Failed to send for review"}), 500
+
+
+@app.route("/analyst/cases/<case_id>/submit-to-frc", methods=["POST"])
+def analyst_submit_to_frc(case_id):
+    """
+    Manually submit (or re-submit) a FraudGuard analyst case to the FRC backend.
+
+    POST body (optional JSON):
+      { "force": true }   — set force=true to re-submit even if already submitted.
+
+    Returns:
+      { success, frc_case_id, status, message, frc_submission }
+    """
+    try:
+        case = analyst_cases_col.find_one({"case_id": case_id})
+        if not case:
+            return jsonify({"success": False, "error": "Case not found"}), 404
+
+        data  = request.get_json(silent=True) or {}
+        force = bool(data.get("force", False))
+
+        existing_frc_id = case.get("frc_case_id")
+        if existing_frc_id and not force:
+            return jsonify({
+                "success": True,
+                "frc_case_id": existing_frc_id,
+                "status": "already_submitted",
+                "message": f"Case already submitted to FRC as {existing_frc_id}. Pass force=true to re-submit.",
+                "frc_submission": {
+                    "success": True,
+                    "frc_case_id": existing_frc_id,
+                    "status": "already_submitted",
+                },
+            }), 200
+
+        # Perform submission
+        frc_result = submit_to_frc(case)
+        now = datetime.utcnow().isoformat()
+
+        if frc_result["success"]:
+            analyst_cases_col.update_one({"case_id": case_id}, {"$set": {
+                "frc_submission_status": "acknowledged",
+                "frc_case_id":           frc_result.get("frc_case_id"),
+                "frc_submitted_at":      now,
+                "status":                "escalated",
+                "last_action":           f"Submitted to FRC: {frc_result.get('frc_case_id')}",
+            }})
+        else:
+            analyst_cases_col.update_one({"case_id": case_id}, {"$set": {
+                "frc_submission_status": "failed",
+                "frc_submission_error":  frc_result.get("error", ""),
+                "last_action":           f"FRC submission failed: {frc_result.get('error', '')[:80]}",
+            }})
+
+        log_admin_action("submit_to_frc", {
+            "case_id":   case_id,
+            "success":   frc_result["success"],
+            "frc_case_id": frc_result.get("frc_case_id"),
+        })
+
+        updated = analyst_cases_col.find_one({"case_id": case_id})
+        return jsonify({
+            "success":     frc_result["success"],
+            "frc_case_id": frc_result.get("frc_case_id"),
+            "status":      frc_result.get("status"),
+            "message":     frc_result.get("message"),
+            "frc_submission": frc_result,
+            "case": _serialize_case(updated),
+        }), 200 if frc_result["success"] else 502
+
+    except Exception as e:
+        log.exception("analyst_submit_to_frc failed")
+        return jsonify({"success": False, "error": "FRC submission endpoint error"}), 500
 
 # ─────────────────────────────────────────────
 # Run
