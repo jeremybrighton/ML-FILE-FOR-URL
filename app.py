@@ -136,11 +136,17 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 # ─── FRC Integration ──────────────────────────────────────────────────────────
-# Set these environment variables in Render (or .env locally).
-FRC_API_URL      = os.environ.get("FRC_API_URL",
-                                   "https://financial-intelligence-processing-system.onrender.com/api/v1")
-FRC_API_KEY      = os.environ.get("FRC_API_KEY", "")          # X-Institution-API-Key
-FRC_INTAKE_PATH  = "/intake/cases"
+# FRC_API_URL and FRC_API_KEY can be overridden via Render environment variables.
+# The defaults below point to the live FRC backend with the FraudGuard institution key.
+FRC_API_URL     = os.environ.get(
+    "FRC_API_URL",
+    "https://financial-intelligence-processing-system.onrender.com/api/v1",
+)
+FRC_API_KEY     = os.environ.get(
+    "FRC_API_KEY",
+    "frc_saaY9yYRvg4DeqTfEcENMArdqMOPiuHZ0AA4y2t8gtCEDpvE",   # FraudGuard Demo Bank
+)
+FRC_INTAKE_PATH = "/intake/cases"
 
 # Chunk size for insert_many batches (tunable via env var)
 MONGO_INSERT_CHUNK = int(os.environ.get("MONGO_INSERT_CHUNK", 200))
@@ -560,91 +566,100 @@ def send_email_otp(to_email, otp_code):
         return False
 
 # ═════════════════════════════════════════════
-# ML Helpers — hardened predict_internal
+# ML Helpers
 # ═════════════════════════════════════════════
 
-# Required columns that must exist before we attempt prediction.
-# These are the raw input columns the model was trained on (pre-dummies).
-REQUIRED_INPUT_COLS = [
+# Common column name aliases — maps alternative names to the canonical names
+# the model was trained on. This allows CSVs with different column conventions
+# (capitalised, spaces, underscores) to work without requiring exact naming.
+_COL_ALIASES: dict = {
+    # step
+    "Step": "step", "STEP": "step",
+    # amount
+    "Amount": "amount", "AMOUNT": "amount", "transaction_amount": "amount",
+    # oldbalanceOrg
+    "OldbalanceOrg": "oldbalanceOrg", "oldbalance_org": "oldbalanceOrg",
+    "old_balance_org": "oldbalanceOrg", "balance_orig": "oldbalanceOrg",
+    "oldBalanceOrig": "oldbalanceOrg",
+    # newbalanceOrig
+    "NewbalanceOrig": "newbalanceOrig", "newbalance_orig": "newbalanceOrig",
+    "new_balance_orig": "newbalanceOrig", "newBalanceOrig": "newbalanceOrig",
+    # oldbalanceDest
+    "OldbalanceDest": "oldbalanceDest", "oldbalance_dest": "oldbalanceDest",
+    "old_balance_dest": "oldbalanceDest", "oldBalanceDest": "oldbalanceDest",
+    # newbalanceDest
+    "NewbalanceDest": "newbalanceDest", "newbalance_dest": "newbalanceDest",
+    "new_balance_dest": "newbalanceDest", "newBalanceDest": "newbalanceDest",
+    # type
+    "Type": "type", "TYPE": "type", "transaction_type": "type", "txn_type": "type",
+}
+
+# Numeric columns the model needs — any missing ones will be filled with 0
+# so the model still runs on partial CSVs.
+_NUMERIC_FILL_COLS = [
     "step", "amount", "oldbalanceOrg", "newbalanceOrig",
     "oldbalanceDest", "newbalanceDest",
 ]
 
+
 def predict_internal(new_data: pd.DataFrame) -> pd.DataFrame:
     """
-    Run batch fraud prediction.
+    Run batch fraud prediction on a DataFrame.
 
-    Parameters
-    ----------
-    new_data : pd.DataFrame
-        Raw transaction data.  May contain extra columns — they are ignored.
+    Accepts any CSV structure — normalises column names via _COL_ALIASES,
+    fills missing numeric columns with 0, runs get_dummies + feature alignment,
+    and returns a DataFrame with columns: prediction, fraud_score, risk_level.
 
-    Returns
-    -------
-    pd.DataFrame with columns: prediction, fraud_score, risk_level
-
-    Raises
-    ------
-    ValueError  with a 'stage' attribute set to the failing pipeline step.
+    Never raises on missing columns — fills them with sensible defaults so the
+    model always produces a result.
     """
+    log.info(f"[predict_internal] Input shape: {new_data.shape}, columns: {list(new_data.columns)}")
 
-    # ── 1. Validate shape / required columns ──────────────────────────────
-    log.info(f"[predict_internal] Input shape: {new_data.shape}")
-    log.info(f"[predict_internal] Columns: {list(new_data.columns)}")
+    # ── 1. Normalise column names ─────────────────────────────────────────
+    rename_map = {col: _COL_ALIASES[col] for col in new_data.columns if col in _COL_ALIASES}
+    if rename_map:
+        log.info(f"[predict_internal] Renaming columns: {rename_map}")
+        new_data = new_data.rename(columns=rename_map)
 
-    null_counts = new_data.isnull().sum()
-    nonzero_nulls = null_counts[null_counts > 0]
-    if not nonzero_nulls.empty:
-        log.warning(f"[predict_internal] Null counts: {nonzero_nulls.to_dict()}")
+    # ── 2. Fill missing numeric columns with 0 ────────────────────────────
+    for col in _NUMERIC_FILL_COLS:
+        if col not in new_data.columns:
+            log.warning(f"[predict_internal] Column '{col}' missing — filling with 0")
+            new_data = new_data.copy()
+            new_data[col] = 0
 
-    log.info(f"[predict_internal] Dtypes: {new_data.dtypes.to_dict()}")
+    # ── 3. Convert numeric columns to float, coercing errors to NaN → 0 ───
+    for col in _NUMERIC_FILL_COLS:
+        new_data[col] = pd.to_numeric(new_data[col], errors="coerce").fillna(0)
 
-    missing = [c for c in REQUIRED_INPUT_COLS if c not in new_data.columns]
-    if missing:
-        raise PipelineError(f"Missing required columns: {missing}", "column_validation")
-
-    # ── 2. get_dummies ─────────────────────────────────────────────────────
+    # ── 4. get_dummies on categorical columns ─────────────────────────────
     try:
-        t0 = time.time()
         processed = pd.get_dummies(new_data, drop_first=True)
-        log.info(f"[predict_internal] get_dummies done in {time.time()-t0:.3f}s, "
-                 f"shape after: {processed.shape}")
-    except PipelineError:
-        raise
     except Exception as exc:
         log.error(f"[predict_internal] get_dummies failed: {exc}")
         raise PipelineError(f"get_dummies failed: {exc}", "get_dummies") from exc
 
-    # ── 3. Column alignment ────────────────────────────────────────────────
+    # ── 5. Align to model feature columns (fill any gaps with 0) ──────────
     try:
         for col in feature_cols:
             if col not in processed.columns:
                 processed[col] = 0
-        aligned = processed[feature_cols]
-        log.info(f"[predict_internal] Alignment done, shape: {aligned.shape}")
-    except PipelineError:
-        raise
+        aligned = processed[feature_cols].copy()
     except Exception as exc:
         log.error(f"[predict_internal] column alignment failed: {exc}")
         raise PipelineError(f"Column alignment failed: {exc}", "column_alignment") from exc
 
-    # ── 4. astype(float) ───────────────────────────────────────────────────
+    # ── 6. Cast to float, coercing any remaining strings to 0 ─────────────
     try:
-        aligned = aligned.astype(float)
-    except PipelineError:
-        raise
+        aligned = aligned.apply(pd.to_numeric, errors="coerce").fillna(0).astype(float)
     except Exception as exc:
         log.error(f"[predict_internal] astype(float) failed: {exc}")
         raise PipelineError(f"astype(float) failed: {exc}", "astype_float") from exc
 
-    # ── 5. predict_proba ───────────────────────────────────────────────────
+    # ── 7. Predict ────────────────────────────────────────────────────────
     try:
-        t0 = time.time()
         prob = model.predict_proba(aligned)[:, 1]
-        log.info(f"[predict_internal] predict_proba done in {time.time()-t0:.3f}s "
-                 f"for {len(prob)} rows")
-    except PipelineError:
-        raise
+        log.info(f"[predict_internal] predict_proba done for {len(prob)} rows")
     except Exception as exc:
         log.error(f"[predict_internal] predict_proba failed: {exc}")
         raise PipelineError(f"predict_proba failed: {exc}", "predict_proba") from exc
