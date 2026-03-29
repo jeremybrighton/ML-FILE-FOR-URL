@@ -52,12 +52,12 @@
     },
     {
       "rule_id": "SEC44_REG38_STR",
-      "rule_name": "Suspicious Transaction / Activity Report — ML-Detected High Risk",
+      "rule_name": "Suspicious Transaction / Activity Report — ML-Detected Suspicious (>=25%)",
       "act_name": "POCAMLA Act (Revised 2023) and POCAMLA Regulations, 2023",
       "section_or_regulation": "Section 44 of the Act; Regulation 38 of the 2023 Regulations",
       "rule_type": "suspicious_activity_rule",
       "trigger_type": "ml_score_threshold",
-      "threshold_value": 0.7,
+      "threshold_value": 0.25,
       "threshold_unit": "probability",
       "currency": null,
       "applies_to": ["all"],
@@ -67,10 +67,11 @@
       "frc_case_type": "suspicious_activity_report",
       "report_type": "suspicious_transaction_report",
       "submission_mode": "automatic",
+      "submission_classification": "suspicious_transaction_auto_submission",
       "enabled": true,
-      "legal_reason_template": "This transaction has been flagged as a suspicious activity report candidate under Section 44 of the Proceeds of Crime and Anti-Money Laundering Act (Revised 2023) and Regulation 38 of the 2023 Regulations. The ML anomaly model assigned a fraud probability of {ml_score_pct}%, which meets the threshold for suspicious activity reporting. Reporting institutions must report to the Centre within two days of suspicion arising, with sufficient supporting information. This auto-submission satisfies that two-day obligation.",
+      "legal_reason_template": "This transaction has been classified as a suspicious transaction requiring reporting to the Centre under Section 44 of the Proceeds of Crime and Anti-Money Laundering Act (Revised 2023) and Regulation 38 of the 2023 Regulations. The ML anomaly detection model assigned a suspicion probability of {ml_score_pct}%, which meets the institutional auto-submission threshold of 25%. This is not a confirmed fraud determination — it is a suspicious transaction report submitted for FRC assessment.",
       "triggering_rules_frc": ["POCAMLA-S44-STR-GENERAL", "POCAMLA-REG38-STR-DETAIL"],
-      "description": "Reporting institutions must monitor complex, unusual, suspicious, large, and unusual-pattern transactions. Where suspicion of ML/TF/PF arises, the institution must report to the Centre within two days."
+      "description": "Transactions with ML suspicion score >= 25% are automatically submitted to FRC. Below 25% = internal monitoring only. Reduces noise while maintaining POCAMLA compliance."
     },
     {
       "rule_id": "REG37_SOURCE_OF_FUNDS",
@@ -165,8 +166,10 @@
     "kes_critical_threshold": 1950000,
     "usd_ctr_threshold": 15000,
     "usd_crossborder_threshold": 10000,
-    "ml_auto_submit_score": 0.70,
+    "ml_auto_submit_score": 0.25,
+    "ml_monitoring_only_score": 0.10,
     "ml_high_risk_score": 0.50,
+    "_note_thresholds": "ml_auto_submit_score=0.25 means suspicious score >=25% triggers auto-FRC submission. 10%-25% = internal alert only. <10% = monitoring_only.",
     "currency_conversion": {
       "USD_TO_KES": 129.50,
       "EUR_TO_KES": 140.20,

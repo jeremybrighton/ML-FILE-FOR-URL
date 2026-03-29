@@ -127,10 +127,12 @@ def generate_compliance_output(txn: dict, decision: CombinedRiskDecision) -> dic
     legal_reason = _build_legal_reason(decision)
 
     return {
-        "ml_score":              decision.ml_score,
-        "ml_score_pct":          ml_pct,
-        "ml_prediction":         decision.ml_prediction,
-        "ml_risk_level":         decision.ml_risk_level,
+        "ml_score":                  decision.ml_score,
+        "ml_score_pct":              ml_pct,
+        "ml_prediction":             decision.ml_prediction,
+        "ml_risk_level":             decision.ml_risk_level,
+        "submission_reason":         getattr(decision, "submission_reason", ""),
+        "submission_classification": getattr(decision, "submission_classification", ""),
         "matched_legal_rules": [
             {
                 "rule_id":              r.rule_id,
@@ -223,6 +225,9 @@ def build_frc_payload(
         r.rule_id == "REG10_CROSSBORDER" for r in decision.all_matched_rules
     )
 
+    sub_reason = getattr(decision, "submission_reason", "")
+    sub_class  = getattr(decision, "submission_classification", "")
+
     return {
         # ── FRC IntakeRequest fields ───────────────────────────────────────
         "external_report_id":  internal_case_id or transaction_id,
@@ -230,57 +235,62 @@ def build_frc_payload(
         "amount":              round(amount, 2),
         "currency":            currency,
         "transaction_summary": (
-            f"FraudGuard auto-submission: {REPORT_LABELS.get(decision.report_type, decision.report_type)}. "
-            f"ML score: {ml_pct}%. Status: {decision.case_status}. "
-            f"Rules matched: {len(decision.all_matched_rules)}."
+            f"FraudGuard auto-submission | {sub_class or decision.case_status} | "
+            f"ML suspicion: {ml_pct}% | "
+            f"Rules: {len(decision.all_matched_rules)} matched."
         )[:2000],
         "triggering_rules":    triggering_rules or ["POCAMLA-S44-STR-GENERAL"],
         "risk_score":          round(decision.ml_score, 4),
-        "narrative":           legal_reason[:5000],
+        "narrative":           (sub_reason + "\n\n" + legal_reason)[:5000],
         "timestamp":           txn.get("timestamp") or txn.get("created_at") or now,
         "evidence_refs": [
             {
-                "label":            item,
-                "reference_type":   "note",
-                "reference_value":  item,
-                "description":      f"FraudGuard evidence item — {decision.case_status}",
+                "label":          item,
+                "reference_type": "note",
+                "reference_value": item,
+                "description":    f"FraudGuard — {sub_class or decision.case_status}",
             }
             for item in evidence_summary[:10]
         ],
         "submission_metadata": {
-            # ── Extended fields (stored in FRC submission_metadata) ────────
-            "source_system":           "FraudGuard",
-            "source_transaction_id":   transaction_id,
-            "source_internal_case_id": internal_case_id,
-            "institution_code":        INSTITUTION_CODE,
-            "institution_name":        INSTITUTION_NAME,
-            "transaction_type":        str(txn.get("type", "UNKNOWN")).upper(),
-            "amount_in_usd_equivalent": round(amount_usd, 2),
-            "amount_in_kes_equivalent": round(amount_kes, 2),
-            "channel":                 txn.get("channel"),
-            "origin_account_masked":   _mask_account(str(txn.get("nameOrig", ""))),
+            # ── Extended fields stored in FRC submission_metadata ──────────
+            "source_system":              "FraudGuard",
+            "auto_submission":            True,
+            "submission_reason":          sub_reason,
+            "submission_classification":  sub_class,
+            "source_transaction_id":      transaction_id,
+            "source_internal_case_id":    internal_case_id,
+            "institution_code":           INSTITUTION_CODE,
+            "institution_name":           INSTITUTION_NAME,
+            "transaction_type":           str(txn.get("type", "UNKNOWN")).upper(),
+            "amount_in_usd_equivalent":   round(amount_usd, 2),
+            "amount_in_kes_equivalent":   round(amount_kes, 2),
+            "channel":                    txn.get("channel"),
+            "origin_account_masked":      _mask_account(str(txn.get("nameOrig", ""))),
             "destination_account_masked": _mask_account(str(txn.get("nameDest", ""))),
-            "ml_score":                decision.ml_score,
-            "ml_risk_level":           decision.ml_risk_level,
-            "final_risk_level":        decision.final_risk_level,
-            "case_status":             decision.case_status,
-            "report_type":             decision.report_type,
-            "matched_legal_rules": [
-                {"rule_id": r.rule_id, "section": r.section_or_regulation}
+            "suspicious_score":           decision.ml_score,
+            "risk_level":                 decision.final_risk_level,
+            "case_status":                decision.case_status,
+            "report_type":                decision.report_type,
+            "matched_rules": [
+                {
+                    "rule_id":  r.rule_id,
+                    "section":  r.section_or_regulation,
+                    "severity": r.severity,
+                }
+                for r in decision.all_matched_rules
+            ],
+            "legal_basis": [
+                {
+                    "act_name": r.act_name,
+                    "section_or_regulation": r.section_or_regulation,
+                    "rule_name": r.rule_name,
+                }
                 for r in decision.matched_legal_rules
             ],
-            "matched_policy_rules": [
-                {"rule_id": r.rule_id, "rule_name": r.rule_name}
-                for r in decision.matched_policy_rules
-            ],
-            "source_of_funds_flags":   sof_flags,
-            "cross_border_flag":       is_cross_border,
-            "auto_submission_reason":  (
-                f"Automatic submission triggered by: "
-                + ", ".join(r.rule_id for r in decision.all_matched_rules if r.auto_submit)
-                + f" | ML score {ml_pct}%"
-            ),
-            "compliance_flags":        decision.compliance_flags,
-            "submission_timestamp":    now,
+            "source_of_funds_flags":  sof_flags,
+            "cross_border_flag":      is_cross_border,
+            "compliance_flags":       decision.compliance_flags,
+            "submission_timestamp":   now,
         },
     }
