@@ -50,6 +50,7 @@ Response format change (v2 — batch refactor):
 """
 
 import os
+import sys
 import json
 import math
 import time
@@ -69,6 +70,16 @@ import joblib
 import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify, g
+
+# ── Make services/ and utils/ importable from app.py ──────────────────────────
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+for _subdir in ("services", "utils", "config"):
+    _path = os.path.join(_BASE_DIR, _subdir)
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+# Also add base dir so "from services.x import y" works
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 
 # ─────────────────────────────────────────────
@@ -205,6 +216,19 @@ try:
 except Exception as e:
     log.error(f"❌ MongoDB connection failed: {e}")
     raise
+
+# ── Inject MongoDB into compliance services (after DB is initialised) ─────────
+try:
+    from services.compliance_pipeline import run_compliance_pipeline
+    from services import frc_submission_service as _frc_svc
+    _frc_svc.inject_db(db)
+    log.info("✅ Compliance pipeline loaded")
+    _COMPLIANCE_ENABLED = True
+except Exception as _e:
+    log.warning(f"⚠️  Compliance pipeline not available: {_e}. Running without compliance engine.")
+    _COMPLIANCE_ENABLED = False
+    def run_compliance_pipeline(*args, **kwargs):  # type: ignore[misc]
+        return None  # type: ignore[return-value]
 
 # ─────────────────────────────────────────────
 # Load ML Model
@@ -1600,7 +1624,7 @@ def predict_endpoint():
         t_pred_end = time.time()
         log.info(f"[/predict] prediction done in {t_pred_end - t_pred_start:.3f}s")
 
-        # ── Attach results + build Mongo docs ────────────────────────────
+        # ── Attach results + run compliance pipeline + build Mongo docs ─────
         response_data = []
         mongo_docs    = []
         now           = datetime.utcnow()
@@ -1611,24 +1635,74 @@ def predict_endpoint():
             score  = float(results.iloc[i]["fraud_score"])
             risk   = str(results.iloc[i]["risk_level"])
 
-            response_data.append({
-                "transaction_id": txn_id,
-                "prediction":     pred,
-                "fraud_score":    json_safe_value(score),
-                "risk_level":     risk,
-            })
+            # ── Run compliance pipeline per-transaction ────────────────────
+            txn_raw = {k: v for k, v in transactions_list[i].items() if k != ID_COL}
+            compliance_result = None
+            compliance_out    = {}
+            frc_status_str    = "not_required"
+            frc_case_id_str   = None
+            final_risk        = risk
 
-            record = {k: json_safe_value(v)
-                      for k, v in transactions_list[i].items()
-                      if k != ID_COL}
+            if _COMPLIANCE_ENABLED:
+                try:
+                    compliance_result = run_compliance_pipeline(
+                        txn=txn_raw,
+                        ml_score=score,
+                        ml_prediction=pred,
+                        transaction_id=txn_id,
+                    )
+                    if compliance_result:
+                        compliance_out  = compliance_result.compliance_output
+                        frc_status_str  = compliance_result.frc_submission_status
+                        frc_case_id_str = compliance_result.frc_case_id
+                        # Elevate risk level if compliance says higher
+                        crisk = compliance_out.get("final_risk_level", risk)
+                        risk_order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+                        if risk_order.get(crisk, 0) > risk_order.get(risk, 0):
+                            final_risk = crisk
+                except Exception as comp_err:
+                    log.warning(f"[/predict] Compliance pipeline error for {txn_id}: {comp_err}")
+
+            response_item = {
+                "transaction_id":       txn_id,
+                "prediction":           pred,
+                "fraud_score":          json_safe_value(score),
+                "risk_level":           final_risk,
+                "frc_submission_status": frc_status_str,
+            }
+            if frc_case_id_str:
+                response_item["frc_case_id"] = frc_case_id_str
+            if compliance_out:
+                response_item["compliance"] = {
+                    "case_status":         compliance_out.get("case_status"),
+                    "report_type":         compliance_out.get("report_type"),
+                    "report_type_label":   compliance_out.get("report_type_label"),
+                    "legal_reason":        compliance_out.get("legal_reason"),
+                    "submission_mode":     compliance_out.get("submission_mode"),
+                    "matched_legal_rules": compliance_out.get("matched_legal_rules", []),
+                    "matched_policy_rules": compliance_out.get("matched_policy_rules", []),
+                    "compliance_flags":    compliance_out.get("compliance_flags", []),
+                    "amount_usd_equivalent": compliance_out.get("amount_usd_equivalent"),
+                    "amount_kes_equivalent": compliance_out.get("amount_kes_equivalent"),
+                }
+            response_data.append(response_item)
+
+            record = {k: json_safe_value(v) for k, v in txn_raw.items()}
             record.update({
-                "transaction_id": txn_id,
-                "prediction":     pred,
-                "fraud_score":    json_safe_value(score),
-                "risk_level":     risk,
-                "batch_id":       batch_id,
-                "created_at":     now,
+                "transaction_id":        txn_id,
+                "prediction":            pred,
+                "fraud_score":           json_safe_value(score),
+                "risk_level":            final_risk,
+                "batch_id":              batch_id,
+                "created_at":            now,
+                "frc_submission_status": frc_status_str,
+                "frc_case_id":           frc_case_id_str,
             })
+            if compliance_out:
+                record["compliance"] = {
+                    k: json_safe_value(v)
+                    for k, v in compliance_out.items()
+                }
             mongo_docs.append(record)
 
         # ── Batch Mongo writes ────────────────────────────────────────────
@@ -1736,7 +1810,7 @@ def process_dataset():
         log.info(f"[/process-dataset] prediction done in {t_pred_end - t_pred_start:.3f}s "
                  f"for {len(results)} rows")
 
-        # ── Attach predictions ─────────────────────────────────────────────
+        # ── Attach predictions + run compliance pipeline ────────────────────
         df = df.copy()
         df["prediction"]  = results["prediction"].values
         df["fraud_score"] = results["fraud_score"].values
@@ -1749,12 +1823,47 @@ def process_dataset():
         # ── Compute stats ──────────────────────────────────────────────────
         stats = compute_batch_stats(results)
 
-        # ── Build Mongo docs ───────────────────────────────────────────────
+        # ── Run compliance pipeline per row + build Mongo docs ─────────────
         now = datetime.utcnow()
-        mongo_docs = []
-        for row in df.to_dict(orient="records"):
+        mongo_docs       = []
+        auto_submit_count = 0
+        frc_ack_count    = 0
+
+        rows = df.to_dict(orient="records")
+        for row in rows:
             record = {k: json_safe_value(v) for k, v in row.items()}
             record["created_at"] = now
+
+            if _COMPLIANCE_ENABLED:
+                try:
+                    txn_id = str(record.get("transaction_id", ""))
+                    ml_s   = float(record.get("fraud_score", 0))
+                    ml_p   = int(record.get("prediction", 0))
+                    comp   = run_compliance_pipeline(
+                        txn=record,
+                        ml_score=ml_s,
+                        ml_prediction=ml_p,
+                        transaction_id=txn_id,
+                    )
+                    if comp:
+                        record["frc_submission_status"] = comp.frc_submission_status
+                        record["frc_case_id"]           = comp.frc_case_id
+                        co = comp.compliance_output
+                        record["compliance"] = {
+                            k: json_safe_value(v) for k, v in co.items()
+                        }
+                        # Elevate risk level
+                        crisk = co.get("final_risk_level", record.get("risk_level", "LOW"))
+                        risk_order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+                        if risk_order.get(crisk, 0) > risk_order.get(record.get("risk_level", "LOW"), 0):
+                            record["risk_level"] = crisk
+                        if comp.auto_submitted:
+                            auto_submit_count += 1
+                        if comp.frc_case_id:
+                            frc_ack_count += 1
+                except Exception as comp_err:
+                    log.warning(f"[/process-dataset] Compliance error for row: {comp_err}")
+
             mongo_docs.append(record)
 
         # ── Bulk Mongo insert in chunks ────────────────────────────────────
@@ -1763,6 +1872,9 @@ def process_dataset():
         t_mongo_end = time.time()
         log.info(f"[/process-dataset] Mongo write: {inserted} docs in "
                  f"{t_mongo_end - t_mongo_start:.3f}s ({MONGO_INSERT_CHUNK}-doc chunks)")
+        if auto_submit_count:
+            log.info(f"[/process-dataset] Auto-submitted to FRC: {auto_submit_count} transactions | "
+                     f"FRC acknowledged: {frc_ack_count}")
 
         # ── Save batch metadata ────────────────────────────────────────────
         processing_time = round(t_mongo_end - t_request_start, 3)
@@ -1771,6 +1883,8 @@ def process_dataset():
             "file_name":               file_name,
             "source":                  "process_dataset",
             "processing_time_seconds": processing_time,
+            "auto_submitted_to_frc":   auto_submit_count,
+            "frc_acknowledged":        frc_ack_count,
             "created_at":              now,
         })
 
@@ -1788,6 +1902,11 @@ def process_dataset():
             **stats,
             "file_name":                file_name,
             "processing_time_seconds":  processing_time,
+            "compliance_summary": {
+                "auto_submitted_to_frc": auto_submit_count,
+                "frc_acknowledged":      frc_ack_count,
+                "compliance_enabled":    _COMPLIANCE_ENABLED,
+            },
             # Retrieval instructions for the frontend
             "results_url":              f"/batches/{batch_id}/transactions",
             "summary_url":              f"/batches/{batch_id}/summary",
@@ -2563,6 +2682,87 @@ def analyst_submit_to_frc(case_id):
     except Exception as e:
         log.exception("analyst_submit_to_frc failed")
         return jsonify({"success": False, "error": "FRC submission endpoint error"}), 500
+
+# ═════════════════════════════════════════════
+# Compliance — Check Endpoint
+# POST /compliance/check
+# ═════════════════════════════════════════════
+@app.route("/compliance/check", methods=["POST"])
+def compliance_check():
+    """
+    Run the full compliance pipeline on a single transaction without storing it.
+    Useful for testing rules and generating compliance reports for a specific transaction.
+
+    Body: { transaction: {...}, ml_score?: float, ml_prediction?: int }
+    """
+    if not _COMPLIANCE_ENABLED:
+        return jsonify({"success": False, "error": "Compliance engine not available"}), 503
+
+    data = request.get_json(silent=True) or {}
+    txn  = data.get("transaction") or data  # allow top-level transaction fields too
+    if not txn or not isinstance(txn, dict):
+        return jsonify({"success": False, "error": "Request body must contain 'transaction' object"}), 400
+
+    ml_score      = safe_float(data.get("ml_score", 0.0))
+    ml_prediction = safe_int(data.get("ml_prediction", 1 if ml_score >= 0.5 else 0))
+    txn_id        = str(txn.get("transaction_id") or txn.get("id") or "MANUAL_CHECK")
+
+    try:
+        result = run_compliance_pipeline(
+            txn=txn,
+            ml_score=ml_score,
+            ml_prediction=ml_prediction,
+            transaction_id=txn_id,
+        )
+        return jsonify({
+            "success":            True,
+            "transaction_id":     txn_id,
+            "compliance":         result.compliance_output,
+            "auto_submitted":     result.auto_submitted,
+            "frc_submission_status": result.frc_submission_status,
+            "frc_case_id":        result.frc_case_id,
+        }), 200
+    except Exception as e:
+        log.exception("compliance_check failed")
+        return jsonify({"success": False, "error": "Compliance check failed", "detail": str(e)}), 500
+
+
+# ═════════════════════════════════════════════
+# Compliance — Submissions Log
+# GET /compliance/submissions
+# ═════════════════════════════════════════════
+@app.route("/compliance/submissions", methods=["GET"])
+def compliance_submissions():
+    """
+    List recent FRC auto-submission records.
+    Query params: limit (default 50), status (acknowledged|failed|all)
+    """
+    if not _COMPLIANCE_ENABLED:
+        return jsonify({"success": False, "error": "Compliance engine not available"}), 503
+
+    try:
+        from services import frc_submission_service as _frc
+        col = _frc._compliance_submissions_col
+        if col is None:
+            return jsonify({"success": False, "error": "Submissions collection not initialised"}), 503
+
+        limit  = min(safe_int(request.args.get("limit", 50)), 500)
+        status = request.args.get("status", "all")
+
+        query = {}
+        if status != "all":
+            query["status"] = status
+
+        docs = list(col.find(query).sort("created_at", -1).limit(limit))
+        return jsonify({
+            "success":     True,
+            "count":       len(docs),
+            "submissions": serialize_documents(docs),
+        }), 200
+    except Exception as e:
+        log.exception("compliance_submissions failed")
+        return jsonify({"success": False, "error": "Failed to load submissions"}), 500
+
 
 # ─────────────────────────────────────────────
 # Run
